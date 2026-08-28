@@ -1,0 +1,9 @@
+# Ignore Python virtual environment
+backend/venv/
+
+# Node modules
+frontend/node_modules/
+frontend-vue/node_modules/
+
+# Build outputs
+**/dist/
