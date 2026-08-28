@@ -1,5 +1,6 @@
 # Ignore Python virtual environment
 backend/venv/
+backend/chroma_db/
 
 # Node modules
 frontend/node_modules/
