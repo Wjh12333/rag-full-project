@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn>=0.29
+sse-starlette>=2.0
+pypdf>=4.0
+langchain-core>=0.2
+langchain-ollama>=0.1
+langchain-chroma>=0.1
+langchain-text-splitters>=0.2

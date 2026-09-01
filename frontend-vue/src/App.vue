@@ -1,247 +1,206 @@
 <template>
-  <!-- 页面最外层容器 -->
-  <div class="container">
-    <!-- ElementPlus栅格布局，gutter控制列之间间距 -->
-    <el-row :gutter="20">
-      <!-- 左侧8列：文档上传面板 -->
-      <el-col span="8">
-        <!-- 卡片组件，hover悬浮阴影 -->
-        <el-card shadow="hover">
-          <!-- 卡片头部插槽 -->
-          <template #header>
-            <div>文档上传入库</div>
-          </template>
+  <div class="app">
+    <header class="app-header">
+      <h1>知识库助手</h1>
+      <p>基于文档检索的智能问答</p>
+    </header>
 
-          <!-- 文件上传组件，action不填，使用自定义http-request覆盖默认上传行为 -->
-          <!-- accept限制可选文件后缀：pdf、txt -->
-          <el-upload
-            action=""
-            :http-request="customUpload"
-            :show-file-list="true"
-            accept=".pdf,.txt"
-          >
-            <el-button type="primary">选择文档</el-button>
-          </el-upload>
-
-          <!-- 分割线 -->
-          <el-divider />
-
-          <!-- 清空向量库按钮，clearLoading控制loading加载状态 -->
-          <el-button type="warning" @click="clearVectorStore" :loading="clearLoading">清空向量库</el-button>
-        </el-card>
-      </el-col>
-
-      <!-- 右侧16列：对话聊天窗口 -->
-      <el-col span="16">
-        <el-card shadow="hover">
-          <template #header>
-            <div>RAG‑Agent 对话</div>
-          </template>
-
-          <!-- 聊天消息容器，设置高度，超出滚动 -->
-          <div class="chat-window">
-            <!-- 循环渲染聊天列表，idx作为key -->
-            <div v-for="(msg, idx) in chatList" :key="idx" class="msg-item">
-              <!-- 根据消息角色区分样式：human用户 / ai助手 -->
-              <div :class="msg.role === 'human' ? 'human' : 'ai'">
-                <strong>{{ msg.role === 'human' ? '用户' : 'AI' }}</strong>
-                <!-- 消息内容展示 -->
-                <div class="content">{{ msg.content }}</div>
+    <main class="app-body">
+      <aside class="side-panel">
+        <section class="panel-card">
+          <div class="panel-title">知识库</div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-primary" :disabled="uploading || clearing" @click="fileInputRef?.click()">
+              {{ uploading ? '导入中…' : '导入文档' }}
+            </button>
+            <button type="button" class="btn btn-danger" :disabled="clearing || uploading || documents.length === 0" @click="handleClear">
+              {{ clearing ? '清空中…' : '清空' }}
+            </button>
+            <input ref="fileInputRef" type="file" accept=".pdf,.txt" hidden @change="handleUpload" />
+          </div>
+          <p class="hint">支持 PDF / TXT，内容自动分块入库</p>
+          <div class="doc-list">
+            <p v-if="loadingDocs" class="empty">加载中…</p>
+            <p v-else-if="documents.length === 0" class="empty">知识库暂无内容，可以上传文档</p>
+            <template v-else>
+              <p class="stat">共 {{ documents.length }} 个片段</p>
+              <div v-for="doc in documents" :key="doc.id" class="doc-item">
+                <p>{{ preview(doc.content) }}</p>
               </div>
-            </div>
+            </template>
           </div>
+        </section>
+      </aside>
 
-          <el-divider />
+      <section class="chat-panel">
+        <div class="chat-window" ref="chatBodyRef">
+          <div v-if="messages.length === 0" class="chat-empty">
+            <p>你好，我是知识库助手</p>
+            <p>可以询问已上传文档中的内容，也支持计算和时间查询</p>
+          </div>
+          <div
+            v-for="msg in messages"
+            :key="msg.id"
+            :class="['msg', msg.role === 'user' ? 'msg-user' : 'msg-ai']"
+          >
+            <div class="msg-bubble">{{ msg.content || '…' }}</div>
+          </div>
+        </div>
 
-          <!-- 文本域输入框，双向绑定queryText，多行输入 -->
-          <el-input
-            v-model="queryText"
-            type="textarea"
+        <div v-if="error" class="error-bar">{{ error }}</div>
+
+        <div class="chat-input">
+          <textarea
+            v-model="input"
             rows="3"
-            placeholder="请输入你的问题..."
-          />
-
-          <!-- 按钮区域 -->
-          <div class="btn-row">
-            <!-- 发送按钮，loading控制请求中状态，点击触发sendQuery -->
-            <el-button type="primary" @click="sendQuery" :loading="loading">发送提问</el-button>
-            <!-- 清空会话按钮 -->
-            <el-button @click="resetChat">清空会话</el-button>
+            placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+            @keydown="handleKeydown"
+          ></textarea>
+          <div class="chat-actions">
+            <button type="button" class="btn btn-plain" @click="resetChat">清空会话</button>
+            <button v-if="streaming" type="button" class="btn btn-danger" @click="handleStop">停止</button>
+            <button v-else type="button" class="btn btn-primary" :disabled="!input.trim()" @click="handleSend">发送</button>
           </div>
-        </el-card>
-      </el-col>
-    </el-row>
+        </div>
+      </section>
+    </main>
   </div>
 </template>
 
 <script setup>
-// 导入vue组合式API ref：定义响应式变量
-import { ref } from 'vue'
-// 导入axios，用于http接口请求
-import axios from 'axios'
-// ElementPlus全局消息提示组件，必须确保main.js已经完整注册ElementPlus
-import { ElMessage } from 'element-plus'
+import { nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { clearKnowledgeBase, fetchDocuments, streamAgent, uploadDocument } from './api'
 
-/**
- * chatList：聊天消息列表
- * 每条消息结构 {role:'human'|'ai', content:'消息文本'}
- */
-const chatList = ref([])
+const PREVIEW_LIMIT = 200
 
-/**
- * queryText：输入框绑定的用户提问文本
- */
-const queryText = ref('')
+const documents = ref([])
+const loadingDocs = ref(true)
+const uploading = ref(false)
+const clearing = ref(false)
+const messages = ref([])
+const input = ref('')
+const streaming = ref(false)
+const error = ref('')
 
-/**
- * loading：发送请求的loading状态，true代表请求/流式处理中，按钮置灰
- */
-const loading = ref(false)
+const fileInputRef = ref(null)
+const chatBodyRef = ref(null)
+const abortRef = ref(null)
+let idSeq = 0
 
-/**
- * clearLoading：清空向量库按钮loading状态
- */
-const clearLoading = ref(false)
+const nextId = () => ++idSeq
 
+function preview(text) {
+  return text.length > PREVIEW_LIMIT ? `${text.slice(0, PREVIEW_LIMIT)}…` : text
+}
 
-/**
- * 自定义文件上传函数，替换el‑upload默认的ajax上传
- * @param {Object} opt upload组件内部参数对象，opt.file为选中文件对象
- */
-const customUpload = async (opt) => {
-  // 创建FormData表单对象，用于上传二进制文件
-  const formData = new FormData()
-  // 把选中文件追加到表单，字段名file，和后端接口参数对应
-  formData.append('file', opt.file)
+async function loadDocuments() {
+  loadingDocs.value = true
   try {
-    // post请求调用后端上传接口；vite代理会把/api转发到127.0.0.1:8000
-    const res = await axios.post('/api/upload', formData, {
-      // multipart/form-data 文件上传请求头
-      headers: { 'Content-Type': 'multipart/form-data' }
-    })
-    // 成功提示
-    ElMessage.success('文档入库成功：' + res.data.chunk_count + '个分块')
+    const data = await fetchDocuments()
+    documents.value = data.documents
   } catch (err) {
-    // 异常捕获，上传失败提示
-    ElMessage.error('文档处理失败，请检查文件格式')
-    console.error(err)
-  }
-}
-
-
-/**
- * sendQuery：发送用户问题，使用EventSource接收SSE流式返回
- * 对接后端 /api/agent_stream SSE接口
- */
-const sendQuery = async () => {
-  // 简单校验：输入为空直接返回，不发起请求
-  if (!queryText.value.trim()) return
-
-  // 获取用户输入文本
-  const userQuestion = queryText.value.trim()
-
-  // 1.把用户消息推入聊天列表
-  chatList.value.push({ role: 'human', content: userQuestion })
-  // 2.插入一条空AI消息，后续流式片段不断追加到content
-  chatList.value.push({ role: 'ai', content: '' })
-
-  // 清空输入框
-  queryText.value = ''
-  // 打开加载状态
-  loading.value = true
-
-  // 获取刚刚新增的ai空消息对象，用来不断追加流式文本
-  const aiMsg = chatList.value[chatList.value.length - 1]
-
-  // 创建EventSource实例，浏览器原生SSE客户端；url编码用户问题防止特殊字符
-  const eventSource = new EventSource(`/api/agent_stream?user_query=${encodeURIComponent(userQuestion)}&max_loop=3`)
-
-  eventSource.onmessage = (e) => {
-  const item = JSON.parse(e.data)
-  if(item.stage === 'tool_call'){
-    // Agent调用工具提示，追加到聊天框
-    aiMsg.content += "\n" + item.content + "\n"
-  }else if(item.stage === 'tool_result'){
-    // 工具返回结果
-    aiMsg.content += "\n" + item.content + "\n"
-  }else if(item.stage === 'stream_content'){
-    aiMsg.content += item.content
-  }else if(item.stage === 'final_answer'){
-    eventSource.close()
-    loading.value = false
-  }
-}
-
-
-  // onerror：SSE连接异常、断开、报错触发
-  eventSource.onerror = () => {
-    eventSource.close() // 出错关闭连接释放资源
-    loading.value = false
-    ElMessage.warning('流式连接断开')
-  }
-}
-
-
-/**
- * clearVectorStore：调用后端接口清空Chroma向量库
- */
-const clearVectorStore = async () => {
-  clearLoading.value = true // 打开按钮loading
-  try {
-    await axios.get('/api/clear_db')
-    ElMessage.success("向量库已清空")
-  } catch (err) {
-    ElMessage.error("清空向量库失败")
+    error.value = '加载知识库失败，请确认后端服务已启动'
     console.error(err)
   } finally {
-    clearLoading.value = false // 无论成功失败关闭loading
+    loadingDocs.value = false
   }
 }
 
+onMounted(loadDocuments)
 
-/**
- * resetChat：清空前端聊天会话记录，不会影响后端向量库
- */
-const resetChat = () => {
-  chatList.value = []
+watch(
+  messages,
+  async () => {
+    await nextTick()
+    const el = chatBodyRef.value
+    if (el) el.scrollTop = el.scrollHeight
+  },
+  { deep: true }
+)
+
+async function handleUpload(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  uploading.value = true
+  error.value = ''
+  try {
+    const { chunk_count } = await uploadDocument(file)
+    await loadDocuments()
+    messages.value.push({
+      id: nextId(),
+      role: 'assistant',
+      content: `已导入《${file.name}》，共 ${chunk_count} 个片段`,
+    })
+  } catch (err) {
+    error.value = '文档导入失败，请确认文件为 PDF / TXT 格式'
+    console.error(err)
+  } finally {
+    uploading.value = false
+    if (fileInputRef.value) fileInputRef.value.value = ''
+  }
+}
+
+async function handleClear() {
+  if (!window.confirm('确定清空知识库中的全部内容？')) return
+  clearing.value = true
+  error.value = ''
+  try {
+    await clearKnowledgeBase()
+    documents.value = []
+  } catch (err) {
+    error.value = '清空知识库失败'
+    console.error(err)
+  } finally {
+    clearing.value = false
+  }
+}
+
+async function handleSend() {
+  const text = input.value.trim()
+  if (!text || streaming.value) return
+  input.value = ''
+  error.value = ''
+
+  const userMsg = { id: nextId(), role: 'user', content: text }
+  const assistantMsg = reactive({ id: nextId(), role: 'assistant', content: '' })
+  messages.value.push(userMsg, assistantMsg)
+  streaming.value = true
+
+  const controller = new AbortController()
+  abortRef.value = controller
+  try {
+    for await (const event of streamAgent(text, controller.signal)) {
+      if (event.stage === 'stream_content') {
+        assistantMsg.content += event.content
+      } else if (event.stage === 'tool_call' || event.stage === 'tool_result') {
+        assistantMsg.content += `\n${event.content}\n`
+      } else if (event.stage === 'final_answer') {
+        break
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      error.value = '请求失败，请确认后端服务已启动'
+      console.error(err)
+    }
+  } finally {
+    streaming.value = false
+    abortRef.value = null
+  }
+}
+
+function handleStop() {
+  abortRef.value?.abort()
+}
+
+function resetChat() {
+  messages.value = []
+}
+
+function handleKeydown(event) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault()
+    handleSend()
+  }
 }
 </script>
-
-<style scoped>
-/* scoped代表样式仅作用当前组件 */
-.container {
-  padding: 24px; /* 页面整体内边距 */
-}
-
-/* 聊天窗口容器样式 */
-.chat-window {
-  height: 450px; /* 固定高度 */
-  overflow-y: auto; /* 内容超出垂直滚动 */
-  padding: 8px;
-  border: 1px solid #eee;
-}
-
-/* 单条消息外层间距 */
-.msg-item {
-  margin: 12px 0;
-}
-
-/* 用户消息气泡样式 */
-.human {
-  background: #e6f7ff;
-  padding: 10px;
-  border-radius: 6px;
-}
-
-/* AI消息气泡样式 */
-.ai {
-  background: #f5f7fa;
-  padding: 10px;
-  border-radius: 6px;
-}
-
-/* 按钮区域上边距 */
-.btn-row {
-  margin-top: 12px;
-}
-</style>
