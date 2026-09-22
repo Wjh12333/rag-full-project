@@ -5,7 +5,9 @@
     Planner ──► Retriever ──► ToolRunner ──► Writer ──► Critic
        │          多路并行检索      按需         │          │
        │                                        └── 未通过 ──┘
-       └── 每个 Agent 只拿到自己需要的上下文，互不污染
+       ├── 每个 Agent 只拿到自己需要的上下文，互不污染
+       └── 闲聊 / 通用问题短路：need_knowledge=false 且无工具时直接作答，
+           不进检索与评审（省掉 Writer-Critic 的多次 LLM 往返）
 
 相比单 Agent（ReAct 边想边调工具）的差异：
 1. 检索从「一个工具」升级为「独立 Agent」——先改写查询，再多路并行检索、去重合并；
@@ -279,6 +281,30 @@ async def planner_agent(user_query: str, history: str) -> Dict[str, Any]:
 
 
 # ===========================================================================
+# 短路分支｜闲聊 / 通用问题：不进检索与评审，一次 LLM 直接作答
+# Planner 已判定 need_knowledge=false 且无工具可用，此时 Writer 的
+# 「只能用给定资料、否则写资料中未提及」约束会把「你好」逼成拒答，
+# 而 Critic 面对空资料也无事可做。所以这里绕开整条流水线。
+# ===========================================================================
+SMALLTALK_PROMPT = """你是问答助手。本轮问题无需检索知识库，也没有可用工具。
+
+要求：
+1. 直接用你自己的语言能力和常识回答，禁止出现「资料」「知识库」「未提及」这类字眼。
+2. 如果是打招呼或闲聊，友好简短地回应，并顺带一句话说明你还能做什么
+   （基于用户上传的文档回答问题、做四则运算、报当前时间）。
+3. 如果是与文档无关的通用常识问题，直接给出答案，控制在 200 字以内。
+4. 用中文回答，直接输出正文，不要复述本提示、不要写过程性说明。"""
+
+
+async def smalltalk_agent(user_query: str, history: str) -> str:
+    messages = [
+        SystemMessage(content=SMALLTALK_PROMPT),
+        HumanMessage(content=f"【历史对话】\n{history}\n\n【当前问题】\n{user_query}"),
+    ]
+    return _content_of(await _llm.ainvoke(messages)).strip()
+
+
+# ===========================================================================
 # Agent 2｜Retriever：多路并行检索 + 去重 + 编号（独立于生成）
 # ===========================================================================
 async def _retrieve_one(query: str, k: int) -> List[Document]:
@@ -322,13 +348,21 @@ def _format_context(chunks: List[Dict[str, Any]]) -> str:
 
 
 def _citation_check(answer: str, chunk_count: int) -> List[str]:
-    """不依赖模型的硬校验：引用编号是否越界、有资料却零引用。"""
+    """不依赖模型的硬校验：引用编号是否越界、有资料却零引用。
+
+    chunk_count 为 0 表示本轮没有任何资料可供引用，此时不存在引用契约：
+    答案里的 [n] 只是模型沿用了历史对话里的编号，属于无意义的残留，
+    不构成事实性问题。直接放行，否则会把纯工具轮次误判成「引用越界」，
+    拖进永远改不好的重写循环。
+    """
+    if chunk_count <= 0:
+        return []
     cited = {int(x) for x in re.findall(r"\[(\d+)\]", answer)}
     issues = []
     invalid = sorted(i for i in cited if i < 1 or i > chunk_count)
     if invalid:
         issues.append(f"引用了不存在的资料编号：{['[%d]' % i for i in invalid]}")
-    if chunk_count and not cited:
+    if not cited:
         issues.append("答案未标注任何 [n] 引用")
     return issues
 
@@ -451,14 +485,15 @@ async def _emit_answer(answer: str):
 
 async def _agent_loop(
     user_query: str,
-    max_loop: int = 3,
+    max_loop: int = MAX_REVISION,
     session_id: str = "default",
     run_id: str | None = None,
     resume: bool = False,
 ):
     run_id = run_id or uuid.uuid4().hex
-    revision_limit = max(1, max_loop)
-
+    # 调用方可以放宽重写次数，但不超过 MAX_REVISION 配置的上限
+    revision_limit = max(1, min(max_loop, MAX_REVISION))
+ 
     saved = _load_run(run_id) if resume else {}
     steps: Dict[str, Any] = saved.get("steps") or {} if saved.get("query") == user_query else {}
     history = _history_text(session_id)
@@ -479,6 +514,24 @@ async def _agent_loop(
         "agent_step",
         f"Planner 结论：{plan.get('reason') or '—'}｜检索词：{'；'.join(queries) or '无需检索'}",
     )
+
+    # --- 短路：闲聊 / 与文档无关的通用问题，不进 Writer-Critic 流水线 ---
+    if not plan.get("need_knowledge") and not plan.get("need_tools"):
+        answer = str(steps.get("smalltalk") or "")
+        if answer:
+            yield _sse_payload("agent_step", "闲聊/通用问题：命中 checkpoint，跳过生成")
+        else:
+            yield _sse_payload("agent_step", "闲聊/通用问题：跳过检索与评审，直接作答…")
+            answer = await smalltalk_agent(user_query, history)
+            steps["smalltalk"] = answer
+            _save_run(run_id, user_query, steps)
+        if not answer:
+            answer = "抱歉，本次没有生成有效回答。请换一种问法，或先上传相关文档。"
+        async for payload in _emit_answer(answer):
+            yield payload
+        _remember(session_id, user_query, answer)
+        yield _sse_payload("final_answer", "done")
+        return
 
     # --- ② Retriever ---
     chunks = steps.get("retriever")
@@ -523,10 +576,24 @@ async def _agent_loop(
         for attempt in range(start_attempt, revision_limit + 2):
             yield _sse_payload("agent_step", f"Writer：撰写第 {attempt} 稿…")
             draft = await writer_agent(user_query, chunks, tool_outputs, history, feedback)
-            yield _sse_payload("agent_step", "Critic：校验引用编号与事实一致性…")
 
-            verdict = await critic_agent(user_query, chunks, draft)
+            # 先跑零成本的硬校验（纯正则，不含模型调用）
             hard_issues = _citation_check(draft, len(chunks))
+            if hard_issues:
+                # 有硬伤就必定回炉，这一次模型评审的结论用不上，直接省掉
+                yield _sse_payload(
+                    "agent_step",
+                    f"Critic：硬校验发现 {len(hard_issues)} 处问题，跳过模型评审",
+                )
+                verdict = {"passed": False, "issues": [], "fixed_answer": ""}
+            elif not chunks:
+                # 本轮没有资料可供核对，Critic 的检查项都无事可做（纯工具轮次），直接放行
+                yield _sse_payload("agent_step", "Critic：本轮无资料可核对，跳过模型评审")
+                verdict = {"passed": True, "issues": [], "fixed_answer": ""}
+            else:
+                yield _sse_payload("agent_step", "Critic：校验引用编号与事实一致性…")
+                verdict = await critic_agent(user_query, chunks, draft)
+
             issues = hard_issues + verdict["issues"]
 
             steps["writer"] = {"draft": draft, "attempt": attempt}
@@ -609,7 +676,7 @@ async def get_agent_run(run_id: str):
 @app.get("/agent_stream")
 async def agent_stream(
     user_query: str,
-    max_loop: int = 3,
+    max_loop: int = MAX_REVISION,
     session_id: str = "default",
     run_id: str | None = None,
     resume: bool = False,
