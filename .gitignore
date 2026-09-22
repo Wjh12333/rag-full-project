@@ -9,3 +9,6 @@ frontend-vue/node_modules/
 
 # Build outputs
 **/dist/
+
+# Agent 运行时 checkpoint（每次问答都会生成，不入库）
+backend/agent_runs/
