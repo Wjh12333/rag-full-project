@@ -43,7 +43,25 @@
             :key="msg.id"
             :class="['msg', msg.role === 'user' ? 'msg-user' : 'msg-ai']"
           >
-            <div class="msg-bubble">{{ msg.content || '…' }}</div>
+            <div class="msg-main">
+              <div class="msg-bubble">{{ msg.content || '…' }}</div>
+              <details
+                v-if="msg.role === 'assistant' && msg.steps && msg.steps.length"
+                class="agent-trace"
+              >
+                <summary>Agent 执行轨迹 · {{ msg.steps.length }} 步</summary>
+                <ol>
+                  <li
+                    v-for="(step, index) in msg.steps"
+                    :key="index"
+                    :class="['trace-item', `trace-${step.kind}`]"
+                  >
+                    <span class="trace-tag">{{ TRACE_LABEL[step.kind] }}</span>
+                    <span class="trace-text">{{ step.text }}</span>
+                  </li>
+                </ol>
+              </details>
+            </div>
           </div>
         </div>
 
@@ -72,6 +90,7 @@ import { nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { clearKnowledgeBase, fetchDocuments, streamAgent, uploadDocument } from './api'
 
 const PREVIEW_LIMIT = 200
+const TRACE_LABEL = { agent: 'Agent', tool: '调用', result: '返回' }
 
 const documents = ref([])
 const loadingDocs = ref(true)
@@ -162,7 +181,7 @@ async function handleSend() {
   error.value = ''
 
   const userMsg = { id: nextId(), role: 'user', content: text }
-  const assistantMsg = reactive({ id: nextId(), role: 'assistant', content: '' })
+  const assistantMsg = reactive({ id: nextId(), role: 'assistant', content: '', steps: [] })
   messages.value.push(userMsg, assistantMsg)
   streaming.value = true
 
@@ -172,8 +191,12 @@ async function handleSend() {
     for await (const event of streamAgent(text, controller.signal)) {
       if (event.stage === 'stream_content') {
         assistantMsg.content += event.content
-      } else if (event.stage === 'tool_call' || event.stage === 'tool_result') {
-        assistantMsg.content += `\n${event.content}\n`
+      } else if (event.stage === 'agent_step') {
+        assistantMsg.steps.push({ kind: 'agent', text: event.content })
+      } else if (event.stage === 'tool_call') {
+        assistantMsg.steps.push({ kind: 'tool', text: event.content })
+      } else if (event.stage === 'tool_result') {
+        assistantMsg.steps.push({ kind: 'result', text: event.content })
       } else if (event.stage === 'final_answer') {
         break
       }

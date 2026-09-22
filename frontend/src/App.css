@@ -279,3 +279,98 @@ body {
     max-height: 50vh;
   }
 }
+
+/* ---------- 多 Agent 执行轨迹 ---------- */
+.msg-main {
+  max-width: 80%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.msg-user .msg-main {
+  align-items: flex-end;
+}
+
+/* 气泡宽度改由 .msg-main 统一控制 */
+.msg-bubble {
+  max-width: 100%;
+}
+
+.agent-trace {
+  width: 100%;
+  padding: 0 10px;
+  font-size: 12px;
+  color: #6b7280;
+  background: #fafbfc;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.agent-trace summary {
+  padding: 6px 0;
+  color: #6b7280;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.agent-trace summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-trace summary::before {
+  content: '▸ ';
+}
+
+.agent-trace[open] summary::before {
+  content: '▾ ';
+}
+
+.agent-trace ol {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px 0 10px;
+  overflow-y: auto;
+  list-style: none;
+  border-top: 1px dashed #e5e7eb;
+}
+
+.trace-item {
+  display: flex;
+  gap: 6px;
+  padding: 3px 0;
+  line-height: 1.5;
+}
+
+.trace-tag {
+  flex-shrink: 0;
+  min-width: 52px;
+  padding: 0 6px;
+  font-size: 11px;
+  text-align: center;
+  color: #475569;
+  background: #eef2f7;
+  border-radius: 4px;
+}
+
+.trace-agent .trace-tag {
+  color: #4f46e5;
+  background: #eef2ff;
+}
+
+.trace-tool .trace-tag {
+  color: #c2410c;
+  background: #fff7ed;
+}
+
+.trace-result .trace-tag {
+  color: #15803d;
+  background: #f0fdf4;
+}
+
+.trace-text {
+  color: #475569;
+  word-break: break-word;
+}

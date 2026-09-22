@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { clearKnowledgeBase, fetchDocuments, streamAgent, uploadDocument } from './api'
-import type { ChatMessage, KnowledgeItem } from './types'
+import type { ChatMessage, KnowledgeItem, StepKind } from './types'
 import './App.css'
 
 const PREVIEW_LIMIT = 200
+const TRACE_LABEL: Record<StepKind, string> = { agent: 'Agent', tool: '调用', result: '返回' }
 
 function preview(text: string): string {
   return text.length > PREVIEW_LIMIT ? `${text.slice(0, PREVIEW_LIMIT)}…` : text
@@ -91,24 +92,37 @@ export default function App() {
     setError('')
 
     const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text }
-    const assistantMsg: ChatMessage = { id: nextId(), role: 'assistant', content: '' }
+    const assistantMsg: ChatMessage = { id: nextId(), role: 'assistant', content: '', steps: [] }
     setMessages(prev => [...prev, userMsg, assistantMsg])
     setStreaming(true)
+
+    const patchAssistant = (patch: (msg: ChatMessage) => ChatMessage) => {
+      setMessages(prev => prev.map(m => (m.id === assistantMsg.id ? patch(m) : m)))
+    }
+    const pushStep = (kind: StepKind, text: string) => {
+      patchAssistant(m => ({ ...m, steps: [...(m.steps ?? []), { kind, text }] }))
+    }
 
     const controller = new AbortController()
     abortRef.current = controller
     try {
       for await (const event of streamAgent(text, controller.signal)) {
-        if (event.stage === 'stream_content') {
-          setMessages(prev =>
-            prev.map(m => (m.id === assistantMsg.id ? { ...m, content: m.content + event.content } : m)),
-          )
-        } else if (event.stage === 'tool_call' || event.stage === 'tool_result') {
-          setMessages(prev =>
-            prev.map(m => (m.id === assistantMsg.id ? { ...m, content: `${m.content}\n${event.content}\n` } : m)),
-          )
-        } else if (event.stage === 'final_answer') {
-          break
+        switch (event.stage) {
+          case 'stream_content':
+            patchAssistant(m => ({ ...m, content: m.content + event.content }))
+            break
+          case 'agent_step':
+            pushStep('agent', event.content)
+            break
+          case 'tool_call':
+            pushStep('tool', event.content)
+            break
+          case 'tool_result':
+            pushStep('result', event.content)
+            break
+          case 'final_answer':
+            // 直接结束生成器，reader 会在 return 时释放
+            return
         }
       }
     } catch (err) {
@@ -203,7 +217,22 @@ export default function App() {
             ) : (
               messages.map(msg => (
                 <div key={msg.id} className={`msg ${msg.role === 'user' ? 'msg-user' : 'msg-ai'}`}>
-                  <div className="msg-bubble">{msg.content || '…'}</div>
+                  <div className="msg-main">
+                    <div className="msg-bubble">{msg.content || '…'}</div>
+                    {msg.role === 'assistant' && (msg.steps?.length ?? 0) > 0 && (
+                      <details className="agent-trace">
+                        <summary>Agent 执行轨迹 · {msg.steps?.length ?? 0} 步</summary>
+                        <ol>
+                          {(msg.steps ?? []).map((step, index) => (
+                            <li key={index} className={`trace-item trace-${step.kind}`}>
+                              <span className="trace-tag">{TRACE_LABEL[step.kind]}</span>
+                              <span className="trace-text">{step.text}</span>
+                            </li>
+                          ))}
+                        </ol>
+                      </details>
+                    )}
+                  </div>
                 </div>
               ))
             )}
